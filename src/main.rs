@@ -18,6 +18,8 @@ use roxmltree::{Document, Node};
 use zip::ZipArchive;
 
 const DOC_XML_PATH: &str = "word/document.xml";
+const DOC_RELS_PATH: &str = "word/_rels/document.xml.rels";
+const IMAGE_REL_TYPE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const HISTORY_MAX: usize = 30;
 const PREVIEW_SAMPLE_LINES: usize = 8;
 
@@ -140,19 +142,29 @@ struct ConversionPlan {
 
 #[derive(Clone, Debug, Default)]
 struct UnsupportedSummary {
-    tables: usize,
-    images: usize,
-    footnotes: usize,
-    equations: usize,
+    tables_converted: usize,
+    tables_degraded: usize,
+    images_exported: usize,
+    images_unresolved: usize,
+    footnotes_ignored: usize,
+    equations_ignored: usize,
 }
 
 impl UnsupportedSummary {
     fn add(&mut self, rhs: &UnsupportedSummary) {
-        self.tables += rhs.tables;
-        self.images += rhs.images;
-        self.footnotes += rhs.footnotes;
-        self.equations += rhs.equations;
+        self.tables_converted += rhs.tables_converted;
+        self.tables_degraded += rhs.tables_degraded;
+        self.images_exported += rhs.images_exported;
+        self.images_unresolved += rhs.images_unresolved;
+        self.footnotes_ignored += rhs.footnotes_ignored;
+        self.equations_ignored += rhs.equations_ignored;
     }
+}
+
+#[derive(Clone, Debug)]
+struct AssetFile {
+    relative_path: PathBuf,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -168,6 +180,7 @@ struct ParsedMarkdown {
     markdown: String,
     stats: ParseStats,
     unsupported: UnsupportedSummary,
+    assets: Vec<AssetFile>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +188,7 @@ struct PreparedOutput {
     src: PathBuf,
     output: PathBuf,
     markdown: String,
+    assets: Vec<AssetFile>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +205,9 @@ struct PreviewOutcome {
     totals: ParseStats,
     unsupported: UnsupportedSummary,
     sample_lines: Vec<String>,
+    degraded_files: Vec<String>,
+    ignored_files: Vec<String>,
+    image_files: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -765,6 +782,9 @@ fn generate_preview(plan: ConversionPlan, tx: &Sender<WorkerMessage>) -> AppResu
     let mut totals = ParseStats::default();
     let mut unsupported = UnsupportedSummary::default();
     let mut sample_lines = Vec::new();
+    let mut degraded_files = Vec::new();
+    let mut ignored_files = Vec::new();
+    let mut image_files = Vec::new();
 
     for (idx, file) in plan.files.iter().enumerate() {
         let current = format!(
@@ -794,10 +814,37 @@ fn generate_preview(plan: ConversionPlan, tx: &Sender<WorkerMessage>) -> AppResu
                 totals.headings += parsed.stats.headings;
                 totals.list_items += parsed.stats.list_items;
                 unsupported.add(&parsed.unsupported);
+                if parsed.unsupported.tables_degraded > 0 {
+                    degraded_files.push(format!(
+                        "{} (复杂表格降级 {} 个)",
+                        file.src.display(),
+                        parsed.unsupported.tables_degraded
+                    ));
+                }
+                if parsed.unsupported.images_unresolved > 0
+                    || parsed.unsupported.footnotes_ignored > 0
+                    || parsed.unsupported.equations_ignored > 0
+                {
+                    ignored_files.push(format!(
+                        "{} (图片未解析 {} / 脚注忽略 {} / 公式忽略 {})",
+                        file.src.display(),
+                        parsed.unsupported.images_unresolved,
+                        parsed.unsupported.footnotes_ignored,
+                        parsed.unsupported.equations_ignored
+                    ));
+                }
+                if parsed.unsupported.images_exported > 0 {
+                    image_files.push(format!(
+                        "{} (提取图片 {} 个)",
+                        file.src.display(),
+                        parsed.unsupported.images_exported
+                    ));
+                }
                 prepared.push(PreparedOutput {
                     src: file.src.clone(),
                     output: file.output.clone(),
                     markdown: parsed.markdown,
+                    assets: parsed.assets,
                 });
             }
             Err(err) => failures.push(FileFailure {
@@ -820,6 +867,9 @@ fn generate_preview(plan: ConversionPlan, tx: &Sender<WorkerMessage>) -> AppResu
         totals,
         unsupported,
         sample_lines,
+        degraded_files,
+        ignored_files,
+        image_files,
     })
 }
 
@@ -873,6 +923,40 @@ fn write_outputs(
                     continue;
                 }
             }
+        }
+
+        let mut item_failed = false;
+        for asset in &item.assets {
+            let asset_path = output
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&asset.relative_path);
+            if let Some(asset_parent) = asset_path.parent() {
+                if !asset_parent.as_os_str().is_empty() {
+                    if let Err(err) = fs::create_dir_all(asset_parent) {
+                        failed.push(FileFailure {
+                            src: item.src.clone(),
+                            error: map_io_error(
+                                err,
+                                &format!("无法创建图片目录: {}", asset_parent.display()),
+                            ),
+                        });
+                        item_failed = true;
+                        break;
+                    }
+                }
+            }
+            if let Err(err) = fs::write(&asset_path, &asset.bytes) {
+                failed.push(FileFailure {
+                    src: item.src.clone(),
+                    error: map_io_error(err, &format!("图片写入失败: {}", asset_path.display())),
+                });
+                item_failed = true;
+                break;
+            }
+        }
+        if item_failed {
+            continue;
         }
 
         match fs::write(&output, item.markdown.as_bytes()) {
@@ -1193,11 +1277,16 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
             preview.totals.list_items
         )),
         Line::from(format!(
-            "不支持内容计数: 表格 {} / 图片 {} / 脚注 {} / 公式 {}",
-            preview.unsupported.tables,
-            preview.unsupported.images,
-            preview.unsupported.footnotes,
-            preview.unsupported.equations
+            "边界统计: 表格已转 {} / 表格降级 {} / 图片导出 {} / 图片未解析 {}",
+            preview.unsupported.tables_converted,
+            preview.unsupported.tables_degraded,
+            preview.unsupported.images_exported,
+            preview.unsupported.images_unresolved
+        )),
+        Line::from(format!(
+            "忽略统计: 脚注 {} / 公式 {}",
+            preview.unsupported.footnotes_ignored,
+            preview.unsupported.equations_ignored
         )),
     ];
     if !preview.sample_lines.is_empty() {
@@ -1211,21 +1300,52 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
         inner[0],
     );
 
-    let mut failure_lines = vec![Line::from("失败明细（最多显示 4 条）：")];
-    if preview.failures.is_empty() {
-        failure_lines.push(Line::from("无失败项"));
+    let mut failure_lines = vec![Line::from("失败和边界明细（最多各显示 2 条）：")];
+    if preview.failures.is_empty()
+        && preview.degraded_files.is_empty()
+        && preview.ignored_files.is_empty()
+        && preview.image_files.is_empty()
+    {
+        failure_lines.push(Line::from("无失败项，且无降级/忽略项"));
     } else {
-        for item in preview.failures.iter().take(4) {
+        for item in preview.failures.iter().take(2) {
             failure_lines.push(Line::from(format!(
-                "{} -> {}",
+                "失败: {} -> {}",
                 item.src.display(),
                 format_app_error(&item.error)
             )));
         }
-        if preview.failures.len() > 4 {
+        if preview.failures.len() > 2 {
             failure_lines.push(Line::from(format!(
-                "... 其余 {} 条请调整后重试",
-                preview.failures.len() - 4
+                "... 其余失败 {} 条请调整后重试",
+                preview.failures.len() - 2
+            )));
+        }
+        for line in preview.degraded_files.iter().take(2) {
+            failure_lines.push(Line::from(format!("降级: {line}")));
+        }
+        if preview.degraded_files.len() > 2 {
+            failure_lines.push(Line::from(format!(
+                "... 其余降级 {} 条",
+                preview.degraded_files.len() - 2
+            )));
+        }
+        for line in preview.ignored_files.iter().take(2) {
+            failure_lines.push(Line::from(format!("忽略: {line}")));
+        }
+        if preview.ignored_files.len() > 2 {
+            failure_lines.push(Line::from(format!(
+                "... 其余忽略 {} 条",
+                preview.ignored_files.len() - 2
+            )));
+        }
+        for line in preview.image_files.iter().take(2) {
+            failure_lines.push(Line::from(format!("图片: {line}")));
+        }
+        if preview.image_files.len() > 2 {
+            failure_lines.push(Line::from(format!(
+                "... 其余图片提取 {} 条",
+                preview.image_files.len() - 2
             )));
         }
     }
@@ -1601,20 +1721,23 @@ fn extract_markdown_from_docx(path: &Path) -> AppResult<ParsedMarkdown> {
     })?;
 
     let mut xml = String::new();
-    let mut doc_xml = archive.by_name(DOC_XML_PATH).map_err(|_| {
-        AppError::new(
-            ErrorKind::InvalidDocx,
-            format!("无效 DOCX（缺少 {DOC_XML_PATH}）: {}", path.display()),
-        )
-    })?;
-    doc_xml.read_to_string(&mut xml).map_err(|e| {
-        map_io_error(
-            e,
-            &format!("读取 document.xml 失败: {}", path.display()),
-        )
-    })?;
+    {
+        let mut doc_xml = archive.by_name(DOC_XML_PATH).map_err(|_| {
+            AppError::new(
+                ErrorKind::InvalidDocx,
+                format!("无效 DOCX（缺少 {DOC_XML_PATH}）: {}", path.display()),
+            )
+        })?;
+        doc_xml.read_to_string(&mut xml).map_err(|e| {
+            map_io_error(
+                e,
+                &format!("读取 document.xml 失败: {}", path.display()),
+            )
+        })?;
+    }
 
-    parse_document_xml_to_markdown(&xml).map_err(|e| {
+    let rel_map = load_image_relationships(&mut archive);
+    parse_document_xml_to_markdown_with_archive(&xml, &mut archive, &rel_map).map_err(|e| {
         AppError::new(
             ErrorKind::ParseFailed,
             format!("解析失败: {} ({})", path.display(), e.message),
@@ -1622,7 +1745,27 @@ fn extract_markdown_from_docx(path: &Path) -> AppResult<ParsedMarkdown> {
     })
 }
 
+#[cfg(test)]
 fn parse_document_xml_to_markdown(xml: &str) -> AppResult<ParsedMarkdown> {
+    let rel_map = HashMap::new();
+    parse_document_xml_to_markdown_core(xml, &rel_map, &mut |_entry| None)
+}
+
+fn parse_document_xml_to_markdown_with_archive<R: Read + std::io::Seek>(
+    xml: &str,
+    archive: &mut ZipArchive<R>,
+    rel_map: &HashMap<String, String>,
+) -> AppResult<ParsedMarkdown> {
+    parse_document_xml_to_markdown_core(xml, rel_map, &mut |entry| {
+        read_zip_entry_bytes(archive, entry)
+    })
+}
+
+fn parse_document_xml_to_markdown_core(
+    xml: &str,
+    rel_map: &HashMap<String, String>,
+    read_entry: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> AppResult<ParsedMarkdown> {
     let doc = Document::parse(xml).map_err(|e| {
         AppError::new(
             ErrorKind::ParseFailed,
@@ -1632,31 +1775,40 @@ fn parse_document_xml_to_markdown(xml: &str) -> AppResult<ParsedMarkdown> {
 
     let mut out_lines: Vec<String> = Vec::new();
     let mut stats = ParseStats::default();
-    let unsupported = detect_unsupported(&doc);
+    let mut unsupported = UnsupportedSummary::default();
+    let mut assets = Vec::new();
+    let mut image_index = 1usize;
 
-    for para in doc.descendants().filter(|n| n.tag_name().name() == "p") {
-        let text = paragraph_text(para);
-        if text.trim().is_empty() {
-            out_lines.push(String::new());
-            continue;
-        }
+    let body = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "body")
+        .ok_or_else(|| AppError::new(ErrorKind::ParseFailed, "document.xml 缺少 body 节点"))?;
 
-        stats.paragraphs += 1;
-        if let Some(level) = heading_level(para) {
-            out_lines.push(format!("{} {}", "#".repeat(level), text.trim()));
-            out_lines.push(String::new());
-            stats.headings += 1;
-            continue;
-        }
-
-        if is_list_paragraph(para) {
-            out_lines.push(format!("- {}", text.trim()));
-            stats.list_items += 1;
-        } else {
-            out_lines.push(text.trim().to_string());
-            out_lines.push(String::new());
+    for node in body.children().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "p" => {
+                parse_paragraph_block(
+                    node,
+                    rel_map,
+                    read_entry,
+                    &mut image_index,
+                    &mut out_lines,
+                    &mut stats,
+                    &mut unsupported,
+                    &mut assets,
+                );
+            }
+            "tbl" => parse_table_block(
+                node,
+                &mut out_lines,
+                &mut unsupported,
+                &mut stats,
+            ),
+            _ => {}
         }
     }
+
+    collect_ignored_features(&doc, &mut unsupported);
 
     while out_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
         out_lines.pop();
@@ -1669,21 +1821,258 @@ fn parse_document_xml_to_markdown(xml: &str) -> AppResult<ParsedMarkdown> {
         markdown,
         stats,
         unsupported,
+        assets,
     })
 }
 
-fn detect_unsupported(doc: &Document<'_>) -> UnsupportedSummary {
-    let mut out = UnsupportedSummary::default();
+fn load_image_relationships<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(mut rels) = archive.by_name(DOC_RELS_PATH) else {
+        return map;
+    };
+    let mut rel_xml = String::new();
+    if rels.read_to_string(&mut rel_xml).is_err() {
+        return map;
+    }
+    let Ok(doc) = Document::parse(&rel_xml) else {
+        return map;
+    };
+    for rel in doc.descendants().filter(|n| n.tag_name().name() == "Relationship") {
+        let Some(id) = rel
+            .attribute("Id")
+            .or_else(|| rel.attribute("r:Id")) else {
+            continue;
+        };
+        let Some(typ) = rel.attribute("Type") else {
+            continue;
+        };
+        if typ == IMAGE_REL_TYPE {
+            if let Some(target) = rel.attribute("Target") {
+                map.insert(id.to_string(), normalize_word_target(target));
+            }
+        }
+    }
+    map
+}
+
+fn normalize_word_target(target: &str) -> String {
+    let t = target.replace('\\', "/");
+    if t.starts_with("word/") {
+        t
+    } else if t.starts_with('/') {
+        t.trim_start_matches('/').to_string()
+    } else {
+        format!("word/{t}")
+    }
+}
+
+fn parse_paragraph_block(
+    para: Node<'_, '_>,
+    rel_map: &HashMap<String, String>,
+    read_entry: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    image_index: &mut usize,
+    out_lines: &mut Vec<String>,
+    stats: &mut ParseStats,
+    unsupported: &mut UnsupportedSummary,
+    assets: &mut Vec<AssetFile>,
+) {
+    let text = paragraph_text(para);
+    let images = extract_images_from_paragraph(
+        para,
+        rel_map,
+        read_entry,
+        image_index,
+        unsupported,
+        assets,
+    );
+
+    if text.trim().is_empty() && images.is_empty() {
+        out_lines.push(String::new());
+        return;
+    }
+
+    if !text.trim().is_empty() {
+        stats.paragraphs += 1;
+        if let Some(level) = heading_level(para) {
+            out_lines.push(format!("{} {}", "#".repeat(level), text.trim()));
+            out_lines.push(String::new());
+            stats.headings += 1;
+        } else if is_list_paragraph(para) {
+            out_lines.push(format!("- {}", text.trim()));
+            stats.list_items += 1;
+        } else {
+            out_lines.push(text.trim().to_string());
+            out_lines.push(String::new());
+        }
+    }
+
+    if !images.is_empty() {
+        for image_line in images {
+            out_lines.push(image_line);
+        }
+        out_lines.push(String::new());
+    }
+}
+
+fn extract_images_from_paragraph(
+    para: Node<'_, '_>,
+    rel_map: &HashMap<String, String>,
+    read_entry: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    image_index: &mut usize,
+    unsupported: &mut UnsupportedSummary,
+    assets: &mut Vec<AssetFile>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for blip in para.descendants().filter(|n| n.tag_name().name() == "blip") {
+        let rel_id = blip
+            .attributes()
+            .find(|attr| attr.name() == "embed" || attr.name() == "r:embed")
+            .map(|attr| attr.value().to_string());
+        let Some(rel_id) = rel_id else {
+            unsupported.images_unresolved += 1;
+            continue;
+        };
+        let Some(target) = rel_map.get(&rel_id) else {
+            unsupported.images_unresolved += 1;
+            continue;
+        };
+        let Some(bytes) = read_entry(target) else {
+            unsupported.images_unresolved += 1;
+            continue;
+        };
+
+        let ext = Path::new(target)
+            .extension()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bin".to_string());
+        let file_name = format!("image_{:03}.{}", *image_index, ext);
+        *image_index += 1;
+        let rel = PathBuf::from("assets").join(&file_name);
+        assets.push(AssetFile {
+            relative_path: rel.clone(),
+            bytes,
+        });
+        unsupported.images_exported += 1;
+        lines.push(format!("![{}]({})", file_name, rel.to_string_lossy().replace('\\', "/")));
+    }
+    lines
+}
+
+fn read_zip_entry_bytes<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    entry_name: &str,
+) -> Option<Vec<u8>> {
+    let Ok(mut file) = archive.by_name(entry_name) else {
+        return None;
+    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn parse_table_block(
+    table: Node<'_, '_>,
+    out_lines: &mut Vec<String>,
+    unsupported: &mut UnsupportedSummary,
+    stats: &mut ParseStats,
+) {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut degraded = false;
+    let mut max_cols = 0usize;
+
+    for tr in table.children().filter(|n| n.is_element() && n.tag_name().name() == "tr") {
+        let mut row = Vec::new();
+        for tc in tr.children().filter(|n| n.is_element() && n.tag_name().name() == "tc") {
+            if cell_has_complex_merge(tc) {
+                degraded = true;
+            }
+            let mut cell_texts = Vec::new();
+            for p in tc.descendants().filter(|n| n.tag_name().name() == "p") {
+                let t = paragraph_text(p).trim().to_string();
+                if !t.is_empty() {
+                    cell_texts.push(t);
+                }
+            }
+            row.push(cell_texts.join("<br>"));
+        }
+        if row.len() > max_cols {
+            max_cols = row.len();
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    if degraded {
+        unsupported.tables_degraded += 1;
+        out_lines.push("> [!NOTE] 该表格含合并单元格，已降级为纯文本块".to_string());
+        for (idx, row) in rows.iter().enumerate() {
+            out_lines.push(format!("行{}: {}", idx + 1, row.join(" | ")));
+        }
+        out_lines.push(String::new());
+        return;
+    }
+
+    unsupported.tables_converted += 1;
+    let mut normalized = Vec::new();
+    for mut row in rows {
+        if row.len() < max_cols {
+            row.extend(std::iter::repeat(String::new()).take(max_cols - row.len()));
+        }
+        normalized.push(row);
+    }
+    if normalized.is_empty() {
+        return;
+    }
+
+    let header = &normalized[0];
+    out_lines.push(format!("| {} |", header.join(" | ")));
+    out_lines.push(format!(
+        "| {} |",
+        std::iter::repeat("---").take(max_cols).collect::<Vec<_>>().join(" | ")
+    ));
+    for row in normalized.iter().skip(1) {
+        out_lines.push(format!("| {} |", row.join(" | ")));
+    }
+    out_lines.push(String::new());
+    stats.paragraphs += 1;
+}
+
+fn cell_has_complex_merge(tc: Node<'_, '_>) -> bool {
+    for n in tc.descendants() {
+        if n.tag_name().name() == "vMerge" {
+            return true;
+        }
+        if n.tag_name().name() == "gridSpan" {
+            let span = n
+                .attributes()
+                .find(|attr| attr.name() == "val" || attr.name() == "w:val")
+                .map(|attr| attr.value().to_string())
+                .unwrap_or_else(|| "1".to_string());
+            if span.parse::<usize>().unwrap_or(1) > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_ignored_features(doc: &Document<'_>, unsupported: &mut UnsupportedSummary) {
     for node in doc.descendants() {
         match node.tag_name().name() {
-            "tbl" => out.tables += 1,
-            "drawing" | "pict" => out.images += 1,
-            "footnoteReference" | "endnoteReference" => out.footnotes += 1,
-            "oMath" | "oMathPara" => out.equations += 1,
+            "footnoteReference" | "endnoteReference" => unsupported.footnotes_ignored += 1,
+            "oMath" | "oMathPara" => unsupported.equations_ignored += 1,
             _ => {}
         }
     }
-    out
 }
 
 fn paragraph_text(para: Node<'_, '_>) -> String {
@@ -1956,17 +2345,65 @@ mod tests {
         let xml = r#"
             <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
                 <w:body>
-                    <w:tbl></w:tbl>
-                    <w:p><w:r><w:drawing/></w:r></w:p>
+                    <w:tbl>
+                        <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
+                    </w:tbl>
+                    <w:p><w:r><w:drawing><a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" r:embed="rId9" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></w:drawing></w:r></w:p>
                     <w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
                     <m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"></m:oMath>
                 </w:body>
             </w:document>
         "#;
         let parsed = parse_document_xml_to_markdown(xml).unwrap();
-        assert_eq!(parsed.unsupported.tables, 1);
-        assert_eq!(parsed.unsupported.images, 1);
-        assert_eq!(parsed.unsupported.footnotes, 1);
-        assert_eq!(parsed.unsupported.equations, 1);
+        assert_eq!(parsed.unsupported.tables_converted, 1);
+        assert_eq!(parsed.unsupported.images_unresolved, 1);
+        assert_eq!(parsed.unsupported.footnotes_ignored, 1);
+        assert_eq!(parsed.unsupported.equations_ignored, 1);
+    }
+
+    #[test]
+    fn table_to_markdown_basic() {
+        let xml = r#"
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                <w:body>
+                    <w:tbl>
+                        <w:tr>
+                            <w:tc><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc>
+                            <w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc>
+                        </w:tr>
+                        <w:tr>
+                            <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                            <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+                        </w:tr>
+                    </w:tbl>
+                </w:body>
+            </w:document>
+        "#;
+        let parsed = parse_document_xml_to_markdown(xml).unwrap();
+        assert!(parsed.markdown.contains("| H1 | H2 |"));
+        assert!(parsed.markdown.contains("| --- | --- |"));
+        assert!(parsed.markdown.contains("| A | B |"));
+        assert_eq!(parsed.unsupported.tables_converted, 1);
+    }
+
+    #[test]
+    fn complex_table_degrades() {
+        let xml = r#"
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                <w:body>
+                    <w:tbl>
+                        <w:tr>
+                            <w:tc>
+                                <w:tcPr><w:gridSpan w:val="2"/></w:tcPr>
+                                <w:p><w:r><w:t>Merged</w:t></w:r></w:p>
+                            </w:tc>
+                        </w:tr>
+                    </w:tbl>
+                </w:body>
+            </w:document>
+        "#;
+        let parsed = parse_document_xml_to_markdown(xml).unwrap();
+        assert!(parsed.markdown.contains("该表格含合并单元格"));
+        assert_eq!(parsed.unsupported.tables_degraded, 1);
     }
 }
